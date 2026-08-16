@@ -1,0 +1,10 @@
+bin/
+obj/
+*.log
+*.user
+.vs/
+.vscode/
+appsettings.Development.json
+appsettings.Local.json
+*.tar.gz
+_to_delete/

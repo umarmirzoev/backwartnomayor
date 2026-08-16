@@ -1,0 +1,33 @@
+@WebApi_HostAddress = https://localhost:7102
+@AccessToken = REPLACE_WITH_JWT_ACCESS_TOKEN
+
+### Регистрация юриста
+POST {{WebApi_HostAddress}}/api/v1/authentication/register
+Content-Type: application/json
+
+{
+  "email": "lawyer@example.com",
+  "password": "Replace-With-Strong-Password-1!",
+  "fullName": "Тестовый юрист",
+  "lawFirmName": null,
+  "phoneNumber": null
+}
+
+### Вход
+POST {{WebApi_HostAddress}}/api/v1/authentication/login
+Content-Type: application/json
+
+{
+  "email": "lawyer@example.com",
+  "password": "Replace-With-Strong-Password-1!"
+}
+
+### Текущий профиль
+GET {{WebApi_HostAddress}}/api/v1/authentication/me
+Authorization: Bearer {{AccessToken}}
+Accept: application/json
+
+### Текущая ИИ-квота
+GET {{WebApi_HostAddress}}/api/v1/artificialintelligence/usage
+Authorization: Bearer {{AccessToken}}
+Accept: application/json
