@@ -71,7 +71,7 @@ public sealed class GeminiOptions
     public string Model { get; set; } = "gemini-3.6-flash";
 
     /// <summary>Получает или задаёт сетевой тайм-аут в секундах.</summary>
-    public int TimeoutSeconds { get; set; } = 45;
+    public int TimeoutSeconds { get; set; } = 90;
 
     /// <summary>Получает или задаёт верхнюю границу ответа модели.</summary>
     public int MaxOutputTokens { get; set; } = 8192;
