@@ -1,5 +1,6 @@
 using Application.Interfaces.Services;
 using Infrastructure.Options;
+using Microsoft.Extensions.Logging;
 using Microsoft.Extensions.Options;
 using StackExchange.Redis;
 
@@ -8,6 +9,9 @@ namespace Infrastructure.Caching;
 /// <summary>
 /// Реализует атомарный Redis-счётчик ИИ-квоты по схеме Cache-Aside.
 /// Lua-скрипты не допускают гонку параллельных запросов, а PostgreSQL-снимок используется только для начальной синхронизации.
+/// Redis — ускоряющий кэш, а не обязательная зависимость: если он не настроен или недоступен, счётчик
+/// откатывается на персистентные значения из PostgreSQL, переданные вызывающей стороной, вместо того чтобы
+/// валить всю генерацию черновика необработанным исключением (что раньше превращало каждый запрос в 500).
 /// </summary>
 public sealed class RedisAiQuotaCounter : IAiQuotaCounter, IDisposable
 {
@@ -40,24 +44,27 @@ public sealed class RedisAiQuotaCounter : IAiQuotaCounter, IDisposable
         return tonumber(current)
         """;
 
-    private readonly Lazy<IConnectionMultiplexer> _connection;
+    private readonly Lazy<IConnectionMultiplexer>? _connection;
     private readonly RedisOptions _options;
+    private readonly ILogger<RedisAiQuotaCounter> _logger;
 
     /// <summary>
     /// Инициализирует быстрый счётчик общим подключением Redis и изолированным пространством ключей.
+    /// Пустая строка подключения не считается ошибкой конфигурации — счётчик просто работает
+    /// в режиме отката на PostgreSQL-значения без Redis.
     /// </summary>
     /// <param name="options">Настройки префикса ключей.</param>
-    public RedisAiQuotaCounter(IOptions<RedisOptions> options)
+    /// <param name="logger">Журнал для диагностики недоступности Redis без падения запроса.</param>
+    public RedisAiQuotaCounter(IOptions<RedisOptions> options, ILogger<RedisAiQuotaCounter> logger)
     {
         ArgumentNullException.ThrowIfNull(options);
+        ArgumentNullException.ThrowIfNull(logger);
         _options = options.Value;
+        _logger = logger;
         ArgumentException.ThrowIfNullOrWhiteSpace(_options.KeyPrefix);
-        if (string.IsNullOrWhiteSpace(_options.ConnectionString))
-        {
-            throw new InvalidOperationException("Строка подключения Redis не настроена.");
-        }
-
-        _connection = new Lazy<IConnectionMultiplexer>(CreateConnection);
+        _connection = string.IsNullOrWhiteSpace(_options.ConnectionString)
+            ? null
+            : new Lazy<IConnectionMultiplexer>(CreateConnection);
     }
 
     /// <summary>
@@ -84,13 +91,26 @@ public sealed class RedisAiQuotaCounter : IAiQuotaCounter, IDisposable
             return true;
         }
 
-        var database = _connection.Value.GetDatabase();
-        var key = BuildKey(lawyerId, quotaId);
-        var lifetime = CalculateLifetime(periodEnd);
-        await database.StringSetAsync(key, requestsUsed, lifetime, When.NotExists)
-            .WaitAsync(cancellationToken);
-        var value = await database.StringGetAsync(key).WaitAsync(cancellationToken);
-        return value.HasValue && (long)value < requestsLimit.Value;
+        if (_connection is null)
+        {
+            return requestsUsed < requestsLimit.Value;
+        }
+
+        try
+        {
+            var database = _connection.Value.GetDatabase();
+            var key = BuildKey(lawyerId, quotaId);
+            var lifetime = CalculateLifetime(periodEnd);
+            await database.StringSetAsync(key, requestsUsed, lifetime, When.NotExists)
+                .WaitAsync(cancellationToken);
+            var value = await database.StringGetAsync(key).WaitAsync(cancellationToken);
+            return value.HasValue && (long)value < requestsLimit.Value;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _logger.LogWarning(exception, "Redis недоступен при проверке ИИ-квоты — используется значение из PostgreSQL.");
+            return requestsUsed < requestsLimit.Value;
+        }
     }
 
     /// <summary>
@@ -116,13 +136,26 @@ public sealed class RedisAiQuotaCounter : IAiQuotaCounter, IDisposable
             return true;
         }
 
-        var result = await _connection.Value.GetDatabase()
-            .ScriptEvaluateAsync(
-                ReserveScript,
-                [BuildKey(lawyerId, quotaId)],
-                [requestsUsed, requestsLimit.Value, CalculateLifetimeSeconds(periodEnd)])
-            .WaitAsync(cancellationToken);
-        return (long)result >= 0;
+        if (_connection is null)
+        {
+            return requestsUsed < requestsLimit.Value;
+        }
+
+        try
+        {
+            var result = await _connection.Value.GetDatabase()
+                .ScriptEvaluateAsync(
+                    ReserveScript,
+                    [BuildKey(lawyerId, quotaId)],
+                    [requestsUsed, requestsLimit.Value, CalculateLifetimeSeconds(periodEnd)])
+                .WaitAsync(cancellationToken);
+            return (long)result >= 0;
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _logger.LogWarning(exception, "Redis недоступен при резервировании ИИ-квоты — используется значение из PostgreSQL.");
+            return requestsUsed < requestsLimit.Value;
+        }
     }
 
     /// <summary>
@@ -141,12 +174,24 @@ public sealed class RedisAiQuotaCounter : IAiQuotaCounter, IDisposable
         DateTimeOffset periodEnd,
         CancellationToken cancellationToken)
     {
-        await _connection.Value.GetDatabase()
-            .ScriptEvaluateAsync(
-                SynchronizeScript,
-                [BuildKey(lawyerId, quotaId)],
-                [requestsUsed, CalculateLifetimeSeconds(periodEnd)])
-            .WaitAsync(cancellationToken);
+        if (_connection is null)
+        {
+            return;
+        }
+
+        try
+        {
+            await _connection.Value.GetDatabase()
+                .ScriptEvaluateAsync(
+                    SynchronizeScript,
+                    [BuildKey(lawyerId, quotaId)],
+                    [requestsUsed, CalculateLifetimeSeconds(periodEnd)])
+                .WaitAsync(cancellationToken);
+        }
+        catch (Exception exception) when (exception is not OperationCanceledException)
+        {
+            _logger.LogWarning(exception, "Redis недоступен при синхронизации ИИ-квоты — пропущено без ошибки.");
+        }
     }
 
     /// <summary>
@@ -154,7 +199,7 @@ public sealed class RedisAiQuotaCounter : IAiQuotaCounter, IDisposable
     /// </summary>
     public void Dispose()
     {
-        if (_connection.IsValueCreated)
+        if (_connection is { IsValueCreated: true })
         {
             _connection.Value.Dispose();
         }
