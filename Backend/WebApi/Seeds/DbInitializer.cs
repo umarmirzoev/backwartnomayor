@@ -145,6 +145,15 @@ public sealed class DbInitializer
             var creationResult = await _userManager.CreateAsync(user, _adminOptions.Password);
             EnsureIdentitySucceeded(creationResult, "Не удалось создать bootstrap-суперадминистратора.");
         }
+        else
+        {
+            // Bootstrap-пароль — часть защищённой конфигурации, а не пользовательский секрет:
+            // синхронизируем хеш с текущим значением при каждом запуске, иначе смена пароля
+            // в конфиге не имеет эффекта после первого создания пользователя.
+            var resetToken = await _userManager.GeneratePasswordResetTokenAsync(user);
+            var resetResult = await _userManager.ResetPasswordAsync(user, resetToken, _adminOptions.Password);
+            EnsureIdentitySucceeded(resetResult, "Не удалось синхронизировать пароль bootstrap-суперадминистратора.");
+        }
 
         var requiredRoles = new[]
         {
