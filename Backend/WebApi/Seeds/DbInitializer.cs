@@ -153,6 +153,11 @@ public sealed class DbInitializer
             var resetToken = await _userManager.GeneratePasswordResetTokenAsync(user);
             var resetResult = await _userManager.ResetPasswordAsync(user, resetToken, _adminOptions.Password);
             EnsureIdentitySucceeded(resetResult, "Не удалось синхронизировать пароль bootstrap-суперадминистратора.");
+
+            // Повторные попытки входа с устаревшим паролем (например, во время ротации секрета)
+            // могли заблокировать аккаунт по политике Lockout — снимаем блокировку при каждом старте.
+            await _userManager.SetLockoutEndDateAsync(user, null);
+            await _userManager.ResetAccessFailedCountAsync(user);
         }
 
         var requiredRoles = new[]
